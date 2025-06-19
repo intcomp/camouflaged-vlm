@@ -1,0 +1,796 @@
+import logging
+from functools import partial
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from models import register
+from .mmseg.models.sam import ImageEncoderViT, MaskDecoder, TwoWayTransformer, MaskDecoder1, TwoWayTransformer_maskdecoder1
+from .mmseg.models.sam.prompt_encoder import PromptEncoder
+
+logger = logging.getLogger(__name__)
+from .iou_loss import IOU
+from typing import Any, Optional, Tuple
+import open_clip
+import alpha_clip
+from torchvision import transforms
+from alpha_clip.alpha_clip import mask_transform as alpha_mask_transform
+OPENAI_DATASET_MEAN = (0.48145466, 0.4578275, 0.40821073)
+OPENAI_DATASET_STD = (0.26862954, 0.26130258, 0.27577711)
+
+CAMO_PROMPTS = [
+    "A photo of the camouflaged {}.",
+    "A photo of the concealed {}.",
+    "A photo of the {} camouflaged in the background.",
+    "A photo of the {} concealed in the background.",
+    "A photo of the {} camouflaged to blend in with its surroundings.",
+    "A photo of the {} concealed to blend in with its surroundings.",
+]
+
+def transform_alpha(alpha):
+    alpha = (alpha * 255).type(torch.uint8)
+    # 创建 Transform 操作
+    transform_a = transforms.Compose([
+        transforms.Resize((336, 336)),  # 不需要 ToTensor()，因为 alpha 已是 Tensor
+        transforms.Normalize(mean=0.5, std=0.26)
+    ])
+
+    # 检查 alpha 的通道维度是否正确
+    if alpha.dim() == 2:  # 如果是单通道图像 [H, W]
+        alpha = alpha.unsqueeze(0)  # 添加通道维度变为 [1, H, W]
+
+    # 应用 Transform
+    alpha = transform_a(alpha.float() / 255.0)  # 归一化到 [0, 1] 范围再进行标准化
+    return alpha
+
+
+def get_prompt_template_by_name(name):
+    if name == "camoprompts":
+        template_set = CAMO_PROMPTS
+    elif name == "imagenet":
+        template_set = IMAGENET_PROMPT
+    elif name == "vild":
+        template_set = VILD_PROMPT
+    else:
+        raise NotImplementedError(template_set)
+    return template_set
+
+def init_weights(layer):
+    if type(layer) == nn.Conv2d:
+        nn.init.normal_(layer.weight, mean=0.0, std=0.02)
+        nn.init.constant_(layer.bias, 0.0)
+    elif type(layer) == nn.Linear:
+        nn.init.normal_(layer.weight, mean=0.0, std=0.02)
+        nn.init.constant_(layer.bias, 0.0)
+    elif type(layer) == nn.BatchNorm2d:
+        # print(layer)
+        nn.init.normal_(layer.weight, mean=1.0, std=0.02)
+        nn.init.constant_(layer.bias, 0.0)
+
+class BBCEWithLogitLoss(nn.Module):
+    '''
+    Balanced BCEWithLogitLoss
+    '''
+    def __init__(self):
+        super(BBCEWithLogitLoss, self).__init__()
+
+    def forward(self, pred, gt):
+        eps = 1e-10
+        count_pos = torch.sum(gt) + eps
+        count_neg = torch.sum(1. - gt)
+        ratio = count_neg / count_pos
+        w_neg = count_pos / (count_pos + count_neg)
+
+        bce1 = nn.BCEWithLogitsLoss(pos_weight=ratio)
+        loss = w_neg * bce1(pred, gt)
+
+        return loss
+
+def _iou_loss(pred, target):
+    pred = torch.sigmoid(pred)
+    inter = (pred * target).sum(dim=(2, 3))
+    union = (pred + target).sum(dim=(2, 3)) - inter
+    iou = 1 - (inter / union)
+
+    return iou.mean()
+
+class ConvNeXtCLIP(nn.Module):
+    def __init__(
+        self,
+        model_name="convnext_large_d_320",
+        pretrained="laion2b_s29b_b131k_ft_soup",
+        template_set="camoprompts",
+    ):
+        super().__init__()
+        self.clip_model, _, self.preprocess_val = open_clip.create_model_and_transforms(
+            model_name, pretrained="/media/estar/Data/ywb/OVCamo-main/laion/CLIP-convnext_large_d_320.laion2B-s29B-b131K-ft-soup/open_clip_pytorch_model.bin"
+        )
+        self.mean = OPENAI_DATASET_MEAN
+        self.std = OPENAI_DATASET_STD
+        self.text_tokenizer = open_clip.get_tokenizer(model_name)
+
+        self.template_set = get_prompt_template_by_name(template_set)
+        logger.info(f"Create the CLIP ({model_name + '-' + pretrained}) with template_set {self.template_set}")
+
+        model_name = model_name.lower()
+        assert "convnext_" in model_name
+        self.model_type = "convnext"
+        if "_base" in model_name:
+            self.feat_chans = [128, 128, 256, 512, 1024]
+        elif "_large" in model_name:
+            self.feat_chans = [192, 192, 384, 768, 1536]
+        elif "_xxlarge" in model_name:
+            self.feat_chans = [384, 384, 768, 1536, 3072]
+
+        self.dim_latent = self.clip_model.text_projection.shape[-1]
+        self.out_strides = {"stem": 2, "res2": 4, "res3": 8, "res4": 16, "res5": 32, "emb": -1}
+        self.out_chans = {
+            "stem": self.feat_chans[0],
+            "res2": self.feat_chans[1],
+            "res3": self.feat_chans[2],
+            "res4": self.feat_chans[3],
+            "res5": self.feat_chans[4],
+            "emb": self.dim_latent,
+        }
+
+    def output_shape(self):
+        return {
+            name: dict(channels=self.out_chans[name], stride=self.out_strides[name])
+            for name in ["stem", "res2", "res3", "res4", "res5", "emb"]
+        }
+
+    @property
+    def device(self):
+        for param in self.clip_model.parameters():
+            return param.device
+
+    @torch.no_grad()
+    def get_text_embs(self, text_list, normalize=True):
+        """对输入的所有类别名称都使用一套模板构建平均嵌入
+        return: NumberofClasses,D
+        """
+        self.eval()
+
+        # reference for templates: https://github.com/mlfoundations/open_clip/blob/91f6cce16b7bee90b3b5d38ca305b5b3b67cc200/src/training/imagenet_zeroshot_data.py
+        text_tokens = self.text_tokenizer(text_list).to(self.device)
+
+        # list -> TD
+        cast_dtype = self.clip_model.transformer.get_cast_dtype()
+        x = self.clip_model.token_embedding(text_tokens).to(cast_dtype)  # [num_temp, n_ctx, d_model]
+        #
+        x = x + self.clip_model.positional_embedding.to(cast_dtype)  # 80,77,768  77,768
+
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = self.clip_model.transformer(x, attn_mask=self.clip_model.attn_mask)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+        x = self.clip_model.ln_final(x)  # [batch_size, n_ctx, transformer.width]
+
+        # take feats from the eot embedding (eot_token is the highest number in each sequence)
+        text_embs = x[torch.arange(x.shape[0]), text_tokens.argmax(dim=-1)] @ self.clip_model.text_projection
+
+        if normalize:
+            text_embs = F.normalize(text_embs, dim=-1)  # Nc,768
+        return text_embs
+
+    @torch.no_grad()
+    def get_text_embs_by_template(self, text_list):
+        """对输入的所有类别名称都使用一套模板构建平均嵌入
+        return: NumberofClasses,D
+        """
+        self.eval()
+
+        text_embs = []
+        for text in text_list:
+            # reference for templates: https://github.com/mlfoundations/open_clip/blob/91f6cce16b7bee90b3b5d38ca305b5b3b67cc200/src/training/imagenet_zeroshot_data.py
+            text_tokens = self.text_tokenizer([template.format(text) for template in self.template_set]).to(
+                self.device
+            )
+
+            # list -> TD
+            cast_dtype = self.clip_model.transformer.get_cast_dtype()
+            x = self.clip_model.token_embedding(text_tokens).to(cast_dtype)  # [num_temp, n_ctx, d_model]
+            #
+            x = x + self.clip_model.positional_embedding.to(cast_dtype)  # 80,77,768  77,768
+
+            x = x.permute(1, 0, 2)  # NLD -> LND
+            x = self.clip_model.transformer(x, attn_mask=self.clip_model.attn_mask)
+            x = x.permute(1, 0, 2)  # LND -> NLD
+            x = self.clip_model.ln_final(x)  # [batch_size, n_ctx, transformer.width]
+
+            # take feats from the eot embedding (eot_token is the highest number in each sequence) => Nc,768；这里的意思有点像从[6,77]挑出每一行最大值对应的下标；
+            text_emb = x[torch.arange(x.shape[0]), text_tokens.argmax(dim=-1)] @ self.clip_model.text_projection
+            text_embs.append(text_emb)
+        text_embs = torch.stack(text_embs, dim=0)  # Nc,Nt,768
+
+        text_embs /= text_embs.norm(dim=-1, keepdim=True)
+        text_embs = text_embs.mean(1)
+        text_embs /= text_embs.norm(dim=-1, keepdim=True)
+        return text_embs  # Nc,768
+
+    def visual_feats_to_embs(self, x, normalize: bool = True):
+        """
+        将图像特征转换为图像嵌入向量
+        """
+        self.eval()
+
+        x = self.clip_model.visual.trunk.head(x)
+        x = self.clip_model.visual.head(x)
+        return F.normalize(x, dim=-1) if normalize else x
+
+    @torch.no_grad()
+    def get_visual_feats(self, x):
+        self.eval()
+
+        out = {}
+        x = self.clip_model.visual.trunk.stem(x)
+        out["stem"] = x.contiguous()  # os4
+        for i in range(4):
+            x = self.clip_model.visual.trunk.stages[i](x)
+            out[f"res{i + 2}"] = x.contiguous()  # res 2 (os4), 3 (os8), 4 (os16), 5 (os32)
+
+        x = self.clip_model.visual.trunk.norm_pre(x)
+        out["clip_vis_dense"] = x.contiguous()
+        return out
+
+class PositionEmbeddingRandom(nn.Module):
+    """
+    Positional encoding using random spatial frequencies.
+    """
+
+    def __init__(self, num_pos_feats: int = 64, scale: Optional[float] = None) -> None:
+        super().__init__()
+        if scale is None or scale <= 0.0:
+            scale = 1.0
+        self.register_buffer(
+            "positional_encoding_gaussian_matrix",
+            scale * torch.randn((2, num_pos_feats)),
+        )
+
+    def _pe_encoding(self, coords: torch.Tensor) -> torch.Tensor:
+        """Positionally encode points that are normalized to [0,1]."""
+        # assuming coords are in [0, 1]^2 square and have d_1 x ... x d_n x 2 shape
+        coords = 2 * coords - 1
+        coords = coords @ self.positional_encoding_gaussian_matrix
+        coords = 2 * np.pi * coords
+        # outputs d_1 x ... x d_n x C shape
+        return torch.cat([torch.sin(coords), torch.cos(coords)], dim=-1)
+
+    def forward(self, size: int) -> torch.Tensor:
+        """Generate positional encoding for a grid of the specified size."""
+        h, w = size, size
+        device: Any = self.positional_encoding_gaussian_matrix.device
+        grid = torch.ones((h, w), device=device, dtype=torch.float32)
+        y_embed = grid.cumsum(dim=0) - 0.5
+        x_embed = grid.cumsum(dim=1) - 0.5
+        y_embed = y_embed / h
+        x_embed = x_embed / w
+
+        pe = self._pe_encoding(torch.stack([x_embed, y_embed], dim=-1))
+        return pe.permute(2, 0, 1)  # C x H x W
+
+def resize_to(x: torch.Tensor, tgt_hw: tuple):
+    return F.interpolate(x, size=tgt_hw, mode="bilinear", align_corners=False)
+
+class PixelNormalizer(nn.Module):
+    def __init__(self, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)):
+        """Divide pixel values by 255 = 2**8 - 1, subtract mean per channel and divide by std per channel.
+
+        Args:
+            mean (tuple, optional): the mean value. Defaults to (0.485, 0.456, 0.406).
+            std (tuple, optional): the std value. Defaults to (0.229, 0.224, 0.225).
+        """
+        super().__init__()
+        # self.norm = A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        self.register_buffer(name="mean", tensor=torch.Tensor(mean).reshape(3, 1, 1))
+        self.register_buffer(name="std", tensor=torch.Tensor(std).reshape(3, 1, 1))
+
+    def __repr__(self):
+        return self.__class__.__name__ + f"(mean={self.mean.flatten()}, std={self.std.flatten()})"
+
+    def forward(self, x):
+        """normalize x by the mean and std values
+
+        Args:
+            x (torch.Tensor): input tensor
+
+        Returns:
+            torch.Tensor: output tensor
+
+        Albumentations:
+
+        ```
+            mean = np.array(mean, dtype=np.float32)
+            mean *= max_pixel_value
+            std = np.array(std, dtype=np.float32)
+            std *= max_pixel_value
+            denominator = np.reciprocal(std, dtype=np.float32)
+
+            img = img.astype(np.float32)
+            img -= mean
+            img *= denominator
+        ```
+        """
+        x = x.sub(self.mean)
+        x = x.div(self.std)
+        return x
+
+@register('sam_maskdecoder1_alphaclip')
+class SAM(nn.Module):
+    def __init__(self, inp_size=None, encoder_mode=None, loss=None):
+        super().__init__()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.clip_model, self.clip_preprocess = alpha_clip.load("ViT-L/14@336px",
+                                           alpha_vision_ckpt_pth="/media/estar/Data/ywb/AlphaCLIP-main/checkpoints/clip_l14_336_grit_20m_4xe.pth",
+                                           device='cpu'
+                                           )
+        self.clip_model = self.clip_model.float()
+        for k, p in self.clip_model.named_parameters():
+            p.requires_grad = False
+
+        self.embed_dim = encoder_mode['embed_dim']
+        self.image_encoder = ImageEncoderViT(
+            img_size=inp_size,
+            patch_size=encoder_mode['patch_size'],
+            in_chans=3,
+            embed_dim=encoder_mode['embed_dim'],
+            depth=encoder_mode['depth'],
+            num_heads=encoder_mode['num_heads'],
+            mlp_ratio=encoder_mode['mlp_ratio'],
+            out_chans=encoder_mode['out_chans'],
+            qkv_bias=encoder_mode['qkv_bias'],
+            norm_layer=partial(torch.nn.LayerNorm, eps=1e-6),
+            act_layer=nn.GELU,
+            use_rel_pos=encoder_mode['use_rel_pos'],
+            rel_pos_zero_init=True,
+            window_size=encoder_mode['window_size'],
+            global_attn_indexes=encoder_mode['global_attn_indexes'],
+        )
+        self.prompt_embed_dim = encoder_mode['prompt_embed_dim']
+        # image_embedding_size = inp_size // encoder_mode['patch_size']
+        #
+        # self.prompt_encoder = PromptEncoder(
+        #     embed_dim=self.prompt_embed_dim,
+        #     image_embedding_size=(image_embedding_size, image_embedding_size),
+        #     input_image_size=(inp_size, inp_size),
+        #     mask_in_chans=16,
+        # )
+
+        self.mask_decoder = MaskDecoder1(
+            num_multimask_outputs=3,
+            transformer=TwoWayTransformer_maskdecoder1(
+                depth=2,
+                embedding_dim=self.prompt_embed_dim,
+                mlp_dim=2048,
+                num_heads=8,
+            ),
+            transformer_dim=self.prompt_embed_dim,
+            iou_head_depth=3,
+            iou_head_hidden_dim=256,
+        )
+
+        self.loss_mode = loss
+        if self.loss_mode == 'bce':
+            self.criterionBCE = torch.nn.BCEWithLogitsLoss()
+
+        elif self.loss_mode == 'bbce':
+            self.criterionBCE = BBCEWithLogitLoss()
+
+        elif self.loss_mode == 'iou':
+            self.criterionBCE = torch.nn.BCEWithLogitsLoss()
+            self.criterionIOU = IOU()
+
+        self.pe_layer = PositionEmbeddingRandom(encoder_mode['prompt_embed_dim'] // 2)
+        self.inp_size = inp_size
+        self.image_embedding_size = inp_size // encoder_mode['patch_size']
+        self.no_mask_embed = nn.Embedding(1, encoder_mode['prompt_embed_dim'])
+
+        self.train_text_features = torch.load(
+            "/media/estar/Data/ywb/OVCamoDataset/text-features/ViT-L-14/TrainCamoPromptsTextFeaturesViTB-14-336.pth").to(
+            self.device)
+        self.test_text_features = torch.load(
+            "/media/estar/Data/ywb/OVCamoDataset/text-features/ViT-L-14/TestCamoPromptsTextFeaturesViTB-14-336.pth").to(
+            self.device)
+
+        self.sam_visual_proj = nn.Sequential(
+            nn.LayerNorm(768),
+            nn.Linear(768, 256),
+            nn.LayerNorm(256),
+        )
+
+        self.sam_text_proj = nn.Sequential(
+            nn.LayerNorm(768),
+            nn.Linear(768, 256),
+        )
+
+    def set_input(self, input, mask, label_id, clip_image, clip_zero_mask):
+        self.input = input.to(self.device)
+        self.gt_mask = mask.to(self.device)
+        self.label_id = label_id.to(self.device)
+        self.clip_image = clip_image.to(self.device)
+        self.clip_zero_mask = clip_zero_mask.to(self.device)
+
+    def get_dense_pe(self) -> torch.Tensor:
+        """
+        Returns the positional encoding used to encode point prompts,
+        applied to a dense set of points the shape of the image encoding.
+
+        Returns:
+          torch.Tensor: Positional encoding with shape
+            1x(embed_dim)x(embedding_h)x(embedding_w)
+        """
+        return self.pe_layer(self.image_embedding_size).unsqueeze(0)
+
+    def alpha_clip_process(self, image, alpha):
+        if self.training:
+            text_embeddings = self.train_text_features  #(14, 768)
+        else:
+            text_embeddings = self.test_text_features  #(61, 768)
+        # text_embeddings = self.train_text_features  # (14, 768)
+        image_features = self.clip_model.visual(image, alpha)
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        score = torch.matmul(image_features, text_embeddings.permute(1, 0))
+        pred_1 = score.topk(1, dim=1)[1].squeeze(dim=1)
+        # 1.
+        # label smoothing
+        smoothing = 0.1
+        confidence = 1 - smoothing
+        smooth_score = torch.zeros_like(score).to(score.device)
+        smooth_score.fill_(smoothing)
+        smooth_score.scatter_(1, pred_1.unsqueeze(1), confidence)
+        # 扩展 smooth_score 的维度
+        smooth_score = smooth_score.unsqueeze(-1)  # [1, 14, 1]
+        output_text_features = (smooth_score * text_embeddings).sum(dim=1)
+        # 进行广播相乘并求和
+        # 2.
+        # score = torch.sigmoid(score)
+        # output_text_features = (score.unsqueeze(-1) * text_embeddings).sum(dim=1)  # [1, 768]
+        # 3.
+        # get logits
+        # distances = score
+        # temperature = 0.5
+        # top_p_logits = 0.7
+        # filter_value = float('-inf')
+        # soft_code = F.softmax(-distances / temperature, dim=-1)
+        # # get top-p
+        # sorted_logits, sorted_indices = torch.sort(soft_code, descending=True, dim=-1)
+        # cumulative_probs = torch.cumsum(sorted_logits, dim=-1)
+        # # Remove tokens with cumulative probability above the threshold
+        # sorted_indices_to_remove = cumulative_probs > top_p_logits
+        # # Shift the indices to the right to keep also the first token above the threshold
+        # sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        # sorted_indices_to_remove[..., 0] = 0
+        #
+        # indices_to_remove = sorted_indices_to_remove.scatter(-1, sorted_indices, sorted_indices_to_remove)
+        # soft_code = soft_code.masked_fill(indices_to_remove, filter_value)
+        # soft_code = F.softmax(soft_code, dim=-1)  # (b, 128)
+        # output_text_features = (soft_code.unsqueeze(-1) * text_embeddings).sum(dim=1)
+
+        return image_features.unsqueeze(1), output_text_features.unsqueeze(1), pred_1
+
+    def forward(self):
+        # self.train_class_embs = self.clip.get_text_embs_by_template(self.class_names)
+        # normed_class_embs = self.train_class_embs  # Nc,D
+        # image_deep = self.get_visual_feats(self.input)
+        # self.pred_mask = []
+        bs = 1
+
+        # Embed prompts
+        # sparse_embeddings = torch.empty((bs, 0, self.prompt_embed_dim), device=self.input.device)
+        dense_embeddings = self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
+            bs, -1, self.image_embedding_size, self.image_embedding_size
+        )
+        features = self.image_encoder(self.input)
+        image_pe = self.get_dense_pe()
+
+        #第一阶段
+        # sparse_embeddings = torch.zeros((1, 2, 256)).to(self.input.device)
+        image_feat_1, text_feat_1, _ = self.alpha_clip_process(self.clip_image, self.clip_zero_mask)
+        image_feat_1 = self.sam_visual_proj(image_feat_1)
+        text_feat_1 = self.sam_text_proj(text_feat_1)
+        sparse_embeddings_1 = torch.cat((image_feat_1, text_feat_1), dim=1)
+
+        # Predict masks
+        low_res_masks, iou_predictions = self.mask_decoder(
+            image_embeddings=features,
+            image_pe=image_pe,
+            sparse_prompt_embeddings=sparse_embeddings_1,
+            dense_prompt_embeddings=dense_embeddings,
+            multimask_output=False,
+        )
+
+        # Upscale the masks to the original image resolution
+        masks1 = self.postprocess_masks(low_res_masks, self.inp_size, self.inp_size)
+        # self.pred_cls = self.map_classifier(low_res_masks, image_deep, normed_class_embs)
+        self.pred_mask = masks1
+        # self.pred_mask.append(masks1)
+
+    def infer(self, input, clip_image, clip_zero_mask):
+        bs = 1
+
+        # Embed prompts
+        # sparse_embeddings = torch.empty((bs, 0, self.prompt_embed_dim), device=self.input.device)
+        dense_embeddings = self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
+            bs, -1, self.image_embedding_size, self.image_embedding_size
+        )
+        features = self.image_encoder(input)
+        image_pe = self.get_dense_pe()
+
+        # 第一阶段
+        # sparse_embeddings = torch.zeros((1, 2, 256)).to(self.input.device)
+        image_feat_1, text_feat_1, _ = self.alpha_clip_process(clip_image, clip_zero_mask)
+        image_feat_1 = self.sam_visual_proj(image_feat_1)
+        text_feat_1 = self.sam_text_proj(text_feat_1)
+        sparse_embeddings_1 = torch.cat((image_feat_1, text_feat_1), dim=1)
+
+        # Predict masks
+        low_res_masks, iou_predictions = self.mask_decoder(
+            image_embeddings=features,
+            image_pe=image_pe,
+            sparse_prompt_embeddings=sparse_embeddings_1,
+            dense_prompt_embeddings=dense_embeddings,
+            multimask_output=False,
+        )
+        masks1 = self.postprocess_masks(low_res_masks, self.inp_size, self.inp_size)
+        # alpha = torch.sigmoid(self.postprocess_masks(low_res_masks, 336, 336))
+        # alpha = transform_alpha(alpha)
+        # _, _, pred_cls = self.alpha_clip_process(clip_image, alpha)
+
+        return masks1
+
+        # 第二阶段
+        # alpha = torch.sigmoid(self.postprocess_masks(low_res_masks, 336, 336))
+        # alpha = transform_alpha(alpha)
+        # image_feat_2, text_feat_2, pred_cls = self.alpha_clip_process(clip_image, alpha)
+        # image_feat_2 = self.sam_visual_proj(image_feat_2)
+        # text_feat_2 = self.sam_text_proj(text_feat_2)
+        # sparse_embeddings_2 = torch.cat((image_feat_2, text_feat_2), dim=1)
+        #
+        # low_res_masks, iou_predictions = self.mask_decoder(
+        #     image_embeddings=features,
+        #     image_pe=image_pe,
+        #     sparse_prompt_embeddings=sparse_embeddings_2,
+        #     dense_prompt_embeddings=dense_embeddings,
+        #     multimask_output=False,
+        # )
+        # masks2 = self.postprocess_masks(low_res_masks, self.inp_size, self.inp_size)
+        # return masks2, pred_cls
+
+    def infer_test(self, input, clip_image, clip_zero_mask):
+        bs = 1
+
+        # Embed prompts
+        # sparse_embeddings = torch.empty((bs, 0, self.prompt_embed_dim), device=self.input.device)
+        dense_embeddings = self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
+            bs, -1, self.image_embedding_size, self.image_embedding_size
+        )
+        features = self.image_encoder(input)
+        image_pe = self.get_dense_pe()
+
+        # 第一阶段
+        # sparse_embeddings = torch.zeros((1, 2, 256)).to(self.input.device)
+        image_feat_1, text_feat_1, _ = self.alpha_clip_process(clip_image, clip_zero_mask)
+        image_feat_1 = self.sam_visual_proj(image_feat_1)
+        text_feat_1 = self.sam_text_proj(text_feat_1)
+        sparse_embeddings_1 = torch.cat((image_feat_1, text_feat_1), dim=1)
+
+        # Predict masks
+        low_res_masks, iou_predictions = self.mask_decoder(
+            image_embeddings=features,
+            image_pe=image_pe,
+            sparse_prompt_embeddings=sparse_embeddings_1,
+            dense_prompt_embeddings=dense_embeddings,
+            multimask_output=False,
+        )
+        masks = self.postprocess_masks(low_res_masks, self.inp_size, self.inp_size)
+
+        return masks
+
+    # def process_iter_mask(self, alpha):
+    #     alpha = (alpha.squeeze(0).squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+    #
+    #     pass
+
+    def infer_test_iteration(self, input, clip_image, clip_zero_mask, image_h, image_w, iteration_num=2):
+        bs = 1
+
+        # Embed prompts
+        # sparse_embeddings = torch.empty((bs, 0, self.prompt_embed_dim), device=self.input.device)
+        dense_embeddings = self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
+            bs, -1, self.image_embedding_size, self.image_embedding_size
+        )
+        features = self.image_encoder(input)
+        image_pe = self.get_dense_pe()
+
+
+        # 第一阶段
+        # sparse_embeddings = torch.zeros((1, 2, 256)).to(self.input.device)
+        image_feat_1, text_feat_1, _ = self.alpha_clip_process(clip_image, clip_zero_mask)
+
+        for i in range(iteration_num):
+            image_feat_1 = self.sam_visual_proj(image_feat_1)
+            text_feat_1 = self.sam_text_proj(text_feat_1)
+            sparse_embeddings_1 = torch.cat((image_feat_1, text_feat_1), dim=1)
+
+            # Predict masks
+            low_res_masks, iou_predictions = self.mask_decoder(
+                image_embeddings=features,
+                image_pe=image_pe,
+                sparse_prompt_embeddings=sparse_embeddings_1,
+                dense_prompt_embeddings=dense_embeddings,
+                multimask_output=False,
+            )
+            _, mask_dense_embeddings = self.prompt_encoder(points=None, boxes=None, masks=torch.sigmoid(low_res_masks))
+            dense_embeddings = mask_dense_embeddings
+
+            masks_output = self.postprocess_masks(low_res_masks, self.inp_size, self.inp_size)
+            text_embeddings = self.test_text_features.permute(1, 0)
+            masks = torch.sigmoid(masks_output)
+            alpha = F.interpolate(masks, (336, 336), mode="bilinear", align_corners=False)
+            image_features = self.clip_model.visual(clip_image, alpha)
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            score = torch.matmul(image_features, text_embeddings)
+            pred_1 = score.topk(1, dim=1)[1].squeeze(dim=1)
+            # 重新构建image_feat_1 , text_feat_1
+            smoothing = 0.1
+            confidence = 1 - smoothing
+            smooth_score = torch.zeros_like(score).to(score.device)
+            smooth_score.fill_(smoothing)
+            smooth_score.scatter_(1, pred_1.unsqueeze(1), confidence)
+            # 扩展 smooth_score 的维度
+            smooth_score = smooth_score.unsqueeze(-1)  # [1, 14, 1]
+            output_text_features = (smooth_score * text_embeddings.permute(1,0)).sum(dim=1)
+            image_feat_1 = image_features.unsqueeze(1)
+            text_feat_1 = output_text_features.unsqueeze(1)
+        return masks_output, pred_1, score
+
+    def clip_infer_test1(self, input, label_id, image_feat_path):
+        bs = 1
+        # Embed prompts
+        sparse_embeddings = torch.empty((bs, 0, self.prompt_embed_dim), device=input.device)
+        dense_embeddings = self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
+            bs, -1, self.image_embedding_size, self.image_embedding_size
+        )
+
+        text_feat = self.test_text_features[label_id].unsqueeze(1)
+        image_feat = torch.load(image_feat_path[0]).to(self.device).unsqueeze(1)
+        text_feat = self.sam_text_proj(text_feat)
+        image_feat = self.sam_visual_proj(image_feat)
+        cond_feat = torch.cat((sparse_embeddings, text_feat, image_feat), dim=1)
+        sparse_embeddings = torch.zeros_like(cond_feat).to(input.device)
+
+        features = self.image_encoder(input)
+        image_pe = self.get_dense_pe()
+
+        # Predict masks
+        low_res_masks, iou_predictions = self.mask_decoder(
+            image_embeddings=features,
+            image_pe=image_pe,
+            sparse_prompt_embeddings=sparse_embeddings,
+            dense_prompt_embeddings=dense_embeddings,
+            multimask_output=False,
+        )
+        low_res_masks = self.postprocess_masks(low_res_masks, self.inp_size, self.inp_size)
+
+        return features, image_pe, low_res_masks
+
+    def clip_infer_test2(self, image_embedding, image_pe, image_feat, text_feat):
+        bs = 1
+        # Embed prompts
+        sparse_embeddings = torch.empty((bs, 0, self.prompt_embed_dim), device=image_embedding.device)
+        dense_embeddings = self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
+            bs, -1, self.image_embedding_size, self.image_embedding_size
+        )
+
+        text_feat = self.sam_text_proj(text_feat)
+        image_feat = self.sam_visual_proj(image_feat)
+        sparse_embeddings = torch.cat((sparse_embeddings, text_feat, image_feat), dim=1)
+
+        # Predict masks
+        low_res_masks, iou_predictions = self.mask_decoder(
+            image_embeddings=image_embedding,
+            image_pe=image_pe,
+            sparse_prompt_embeddings=sparse_embeddings,
+            dense_prompt_embeddings=dense_embeddings,
+            multimask_output=False,
+        )
+        masks = self.postprocess_masks(low_res_masks, self.inp_size, self.inp_size)
+
+        return masks
+
+    def postprocess_masks(
+        self,
+        masks: torch.Tensor,
+        input_size: Tuple[int, ...],
+        original_size: Tuple[int, ...],
+    ) -> torch.Tensor:
+        """
+        Remove padding and upscale masks to the original image size.
+
+        Arguments:
+          masks (torch.Tensor): Batched masks from the mask_decoder,
+            in BxCxHxW format.
+          input_size (tuple(int, int)): The size of the image input to the
+            model, in (H, W) format. Used to remove padding.
+          original_size (tuple(int, int)): The original size of the image
+            before resizing for input to the model, in (H, W) format.
+
+        Returns:
+          (torch.Tensor): Batched masks in BxCxHxW format, where (H, W)
+            is given by original_size.
+        """
+        masks = F.interpolate(
+            masks,
+            (self.image_encoder.img_size, self.image_encoder.img_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+        masks = masks[..., : input_size, : input_size]
+        masks = F.interpolate(masks, original_size, mode="bilinear", align_corners=False)
+        return masks
+
+    def backward_G_other(self):
+        """Calculate GAN and L1 loss for the generator"""
+        self.loss_masks = 0.
+        self.loss_fuse = 0.
+        self.loss_dict = {}
+        #loss masks
+        self.loss_masks += self.criterionBCE(self.pred_mask['masks'], self.gt_mask)
+        if self.loss_mode == 'iou':
+            self.loss_masks += _iou_loss(self.pred_mask['masks'], self.gt_mask)
+        self.loss_dict['masks'] = self.loss_masks
+        #loss fuse
+        self.loss_fuse += self.criterionBCE(self.pred_mask['masks_fuse'], self.gt_mask)
+        if self.loss_mode == 'iou':
+            self.loss_fuse += _iou_loss(self.pred_mask['masks_fuse'], self.gt_mask)
+        self.loss_dict['masks_fuse'] = self.loss_fuse
+
+        self.loss_G = self.loss_masks + self.loss_fuse
+        self.loss_G.backward()
+
+    def backward_G_c(self):
+        """Calculate GAN and L1 loss for the generator"""
+        self.loss_mask1 = 0.
+        self.loss_mask2 = 0.
+        self.loss_dict = {}
+        #loss mask1
+        self.loss_mask1 += self.criterionBCE(self.pred_mask[0], self.gt_mask)
+        if self.loss_mode == 'iou':
+            self.loss_mask1 += _iou_loss(self.pred_mask[0], self.gt_mask)
+        self.loss_dict['mask1'] = self.loss_mask1
+
+        #loss mask2
+        self.loss_mask2 += self.criterionBCE(self.pred_mask[1], self.gt_mask)
+        if self.loss_mode == 'iou':
+            self.loss_mask2 += _iou_loss(self.pred_mask[1], self.gt_mask)
+        self.loss_dict['mask2'] = self.loss_mask2
+
+        self.loss_G = self.loss_mask1 + self.loss_mask2
+        self.loss_G.backward()
+
+    def backward_G(self):
+        """Calculate GAN and L1 loss for the generator"""
+        self.loss_G = self.criterionBCE(self.pred_mask, self.gt_mask)
+        if self.loss_mode == 'iou':
+            self.loss_G += _iou_loss(self.pred_mask, self.gt_mask)
+        self.loss_G.backward()
+
+    def optimize_parameters(self):
+        self.forward()
+        self.optimizer.zero_grad()  # set G's gradients to zero
+        self.backward_G()  # calculate graidents for G
+        self.optimizer.step()  # udpate G's weights
+
+    def set_requires_grad(self, nets, requires_grad=False):
+        """Set requies_grad=Fasle for all the networks to avoid unnecessary computations
+        Parameters:
+            nets (network list)   -- a list of networks
+            requires_grad (bool)  -- whether the networks require gradients or not
+        """
+        if not isinstance(nets, list):
+            nets = [nets]
+        for net in nets:
+            if net is not None:
+                for param in net.parameters():
+                    param.requires_grad = requires_grad

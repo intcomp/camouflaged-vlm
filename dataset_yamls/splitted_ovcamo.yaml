@@ -1,0 +1,8 @@
+OVCamo_TR_IMAGE_DIR: /media/estar/Data/ywb/OVCamoDataset/train/image
+OVCamo_TR_MASK_DIR: /media/estar/Data/ywb/OVCamoDataset/train/mask
+OVCamo_TR_DEPTH_DIR: /media/estar/Data/ywb/OVCamoDataset/depth-train-ovcoser
+OVCamo_TE_IMAGE_DIR: /media/estar/Data/ywb/OVCamoDataset/test/image
+OVCamo_TE_MASK_DIR: /media/estar/Data/ywb/OVCamoDataset/test/mask
+OVCamo_CLASS_JSON_PATH: /media/estar/Data/ywb/OVCamoDataset/jsonfile/class_info.json
+OVCamo_SAMPLE_JSON_PATH: /media/estar/Data/ywb/OVCamoDataset/jsonfile/sample_info.json
+

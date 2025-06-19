@@ -1,0 +1,147 @@
+train_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+#      root_path_1: /media/estar/Data/ywb/datasets/TrainDataset/Imgs
+#      root_path_2: /media/estar/Data/ywb/datasets/TrainDataset/GT
+      cache: none
+      split_key: train
+      root_info:
+  wrapper:
+    name: train
+    args:
+      inp_size: 1024
+      augment: false
+  batch_size: 1
+
+val_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+#      root_path_1: /media/estar/Data/ywb/datasets/TestDataset/COD10K/Imgs
+#      root_path_2: /media/estar/Data/ywb/datasets/TestDataset/COD10K/GT
+      cache: none
+      split_key: test
+      root_info:
+  wrapper:
+    name: val
+    args:
+      inp_size: 1024
+  batch_size: 1
+
+test_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+#      root_path_1: /media/estar/Data/ywb/OVCamoDataset/test/image
+#      root_path_2: /media/estar/Data/ywb/OVCamoDataset/test/mask
+      cache: none
+      split_key: test
+      root_info: 
+  wrapper:
+    name: val
+    args:
+      inp_size: 1024
+  batch_size: 1
+
+# 测试的时候输入训练的图像
+train_test_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+#      root_path_1: /media/estar/Data/ywb/OVCamoDataset/test/image
+#      root_path_2: /media/estar/Data/ywb/OVCamoDataset/test/mask
+      cache: none
+      split_key: train
+      root_info:
+  wrapper:
+    name: val
+    args:
+      inp_size: 1024
+  batch_size: 1
+
+eval_type: cod
+sam_checkpoint: ./pretrained/sam_vit_h_4b8939.pth
+data_norm:
+  inp:
+    sub:
+    - 0.5
+    div:
+    - 0.5
+  gt:
+    sub:
+    - 0.5
+    div:
+    - 0.5
+  gt_rgb:
+    sub:
+    - 0.5
+    div:
+    - 0.5
+model:
+  name: sam_maskdecoder1_edge
+  args:
+    inp_size: 1024
+    loss: iou
+    encoder_mode:
+      name: sam
+      img_size: 1024
+      mlp_ratio: 4
+      patch_size: 16
+      qkv_bias: true
+      use_rel_pos: true
+      window_size: 14
+      out_chans: 256
+      scale_factor: 32
+      input_type: fft
+      freq_nums: 0.25
+      prompt_type: highpass
+      prompt_embed_dim: 256
+      tuning_stage: 1234
+      handcrafted_tune: true
+      embedding_tune: true
+      adaptor: adaptor
+      embed_dim: 1280
+      depth: 32
+      num_heads: 16
+      global_attn_indexes:
+      - 7
+      - 15
+      - 23
+      - 31
+optimizer:
+  name: adamw
+  args:
+    lr: 0.0002
+lr_min: 1.0e-7
+epoch_max: 20
+
+multi_step_lr:
+  milestones:
+  - 1
+  gamma: 0.1
+epoch_val: 2
+epoch_save: 1
+
+maple_alpha_clip:
+  MODEL:
+    BACKBONE:
+      NAME: "ViT-L/14@336px"
+    CHECKPPOINT_BEST: ./pretrained/model-best.pth.tar
+
+  TRAINER:
+    MAPLE:
+      N_CTX: 4
+      CTX_INIT: "a photo of a"
+      PREC: "fp32"
+      PROMPT_DEPTH: 9
+
+  INPUT:
+    SIZE: [336, 336]
+    INTERPOLATION: "bicubic"
+    PIXEL_MEAN: [ 0.48145466, 0.4578275, 0.40821073 ]
+    PIXEL_STD: [ 0.26862954, 0.26130258, 0.27577711 ]
+    TRANSFORMS: [ "random_resized_crop", "random_flip", "normalize" ]
+
+#resume: 60
+#start_epoch: 60

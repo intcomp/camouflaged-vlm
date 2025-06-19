@@ -2,7 +2,7 @@
 
 
 
-![abstract_img](.\abstract_img\overview.jpg)
+![abstract_img](abstract_img\overview.jpg)
 
 ## Prepare work
 

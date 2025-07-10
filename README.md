@@ -1,73 +1,61 @@
-# Open-Vocabulary Camouflaged Object Segmentation with Cascaded Vision Language Models
+# Open-Vocabulary Camouflaged Object Segmentation with Cascaded Vision-Language Models
 
 [![arXiv](https://img.shields.io/badge/arXiv-2506.19300-orange.svg)](https://arxiv.org/abs/2506.19300)
 
+---
 
-## Abstract Figure
+## 📌 Overview
 
-![Overview](./show_img/overview.jpg)
+<div align="center">
+  <img src="./show_img/overview.jpg" alt="Framework Overview" width="80%">
+</div>
 
-## Prepare work
+This repository provides the official implementation of our paper:  
+**"Open-Vocabulary Camouflaged Object Segmentation with Cascaded Vision-Language Models"**,  
+which introduces a cascaded two-stage framework for segmenting and recognizing camouflaged objects in open-vocabulary settings.
 
-### Dataset
+---
 
-1. Download *OVCamo* dataset from [link](https://github.com/lartpang/OVCamo).
-2. Change the dataset path in `./datasets/ovcamo_info/splitted_ovcamo.yaml`
+## 📁 Setup
 
-### Pretrained model
+### 🔹 Dataset
 
-- sam-vit-h-pth: [sam_vit_h_4b8939.pth](https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth)
+1. Download the **OVCamo** dataset from the [official repository](https://github.com/lartpang/OVCamo).
+2. Update the dataset path in the following config file:
 
-Put the *sam_vit_h_4b8939.pth*  in the folder `./pretrained`.
+`./datasets/ovcamo_info/splitted_ovcamo.yaml`
 
+### 🔹 Pretrained Model
 
+Download the SAM backbone from Meta AI:
 
-## Demo
+- [sam_vit_h_4b8939.pth](https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth)
 
-![demo_image](./show_img/images.gif)
+Place the file in the `./pretrained` directory:
 
-- best_model_pth: [model_epoch_best.pth]( https://pan.baidu.com/s/1S6rWjBe-MNkV64t83nXKDQ?pwd=3zdc ). And put the *model_epoch_best.pth* in `./best_model_pth`.
+`./pretrained/sam_vit_h_4b8939.pth`
 
-```bash
-python demo.py --img-path ./demo_img/scorpionfish.jpg --output-dir ./demo_img --config ./configs/demo.yaml --model ./best_model_pth/model_epoch_best.pth
-```
+---
 
+## 🚀 Demo
 
+<div align="center">
+  <img src="./show_img/images.gif" alt="Demo Visualization" width="60%">
+</div>
 
-## Train
+Download our best pre-trained model:
 
-### CLIP finetuing
+- [model_epoch_best.pth](https://pan.baidu.com/s/1S6rWjBe-MNkV64t83nXKDQ?pwd=3zdc)
 
-*We will open source this code later.*
+Save it to:
 
-Ours finetuned_clip_pth: [model-best.pth.tar]( https://pan.baidu.com/s/1S6rWjBe-MNkV64t83nXKDQ?pwd=3zdc ). And put the *model-best.pth.tar* in `./pretrained`.
+`./best_model_pth/model_epoch_best.pth`
 
-### Segmentation train
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 torchrun --nnodes 1 --nproc_per_node 2 train_ovcos_maskdecoder_edge.py --config ./configs/ovcos-sam-vit-h-maskdecoder-edge.yaml
-```
-
-- If you want train on more GPUs. Change the *CUDA_VISIBLE_DEVICES* and *nproc_per_node*.
-- Train results will save in `./save`
-
-
-
-## Eval
+Run the demo with:
 
 ```bash
-python test_ovcos_maskdecoder_edge.py --model ./save/*/model_epoch_best.pth
-```
-
-- Test results will save in `./eval_results`
-
-![eval_results](./show_img/eval_results.jpg)
-
-
-
-
-
-
-
-
-
+python demo.py \
+  --img-path ./demo_img/scorpionfish.jpg \
+  --output-dir ./demo_img \
+  --config ./configs/demo.yaml \
+  --model ./best_model_pth/model_epoch_best.pth

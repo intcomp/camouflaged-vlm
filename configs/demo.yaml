@@ -1,0 +1,53 @@
+model:
+  name: sam_maskdecoder_edge
+  args:
+    inp_size: 1024
+    loss: iou
+    encoder_mode:
+      name: sam
+      img_size: 1024
+      mlp_ratio: 4
+      patch_size: 16
+      qkv_bias: true
+      use_rel_pos: true
+      window_size: 14
+      out_chans: 256
+      scale_factor: 32
+      input_type: fft
+      freq_nums: 0.25
+      prompt_type: highpass
+      prompt_embed_dim: 256
+      tuning_stage: 1234
+      handcrafted_tune: true
+      embedding_tune: true
+      adaptor: adaptor
+      embed_dim: 1280
+      depth: 32
+      num_heads: 16
+      global_attn_indexes:
+      - 7
+      - 15
+      - 23
+      - 31
+
+MAPLE_ALPHA_CLIP:
+  MODEL:
+    BACKBONE:
+      NAME: "ViT-L/14@336px"
+    # /media/estar/Data/ywb/ProText-main/output_camo_train/MaPLeAlphaCLIP_50_1/MultiModalPromptLearner/model-best.pth.tar
+    CHECKPPOINT_BEST: ./pretrained/model-best.pth.tar
+
+  TRAINER:
+    MAPLE:
+      N_CTX: 4
+      CTX_INIT: "a photo of a"
+      PREC: "fp32"
+      PROMPT_DEPTH: 9
+
+  INPUT:
+    SIZE: [336, 336]
+    INTERPOLATION: "bicubic"
+    PIXEL_MEAN: [ 0.48145466, 0.4578275, 0.40821073 ]
+    PIXEL_STD: [ 0.26862954, 0.26130258, 0.27577711 ]
+    TRANSFORMS: [ "random_resized_crop", "random_flip", "normalize" ]
+

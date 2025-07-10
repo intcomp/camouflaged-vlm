@@ -1,0 +1,28 @@
+
+TRAIN_CLASS_NAMES=['mantis', 
+                   'owl', 
+                   'grasshopper', 
+                   'katydid', 
+                   'snake', 
+                   'spider', 
+                   'lizard', 
+                   'snow leopard', 
+                   'human', 
+                   'seahorse', 
+                   'pipefish', 
+                   'flatfish', 
+                   'frog', 
+                   'succulent plant']
+
+TEST_CLASS_NAMES=['owlfly larva', 'grouse', 'frogmouth', 'bat', 'bee', 
+                  'bittern', 'mockingbird', 'dragonfly', 'heron', 'egyptian nightjar', 
+                  'potoo', 'cicada', 'butterfly', 'moth', 'slug', 
+                  'reccoon', 'monkey', 'kangaroo', 'mongoose', 'lion', 
+                  'elephant', 'jerboa', 'snail', 'duck', 'cheetah', 
+                  'giraffe', 'ant', 'beetle', 'wolf', 'rabbit', 
+                  'tiger', 'squirrel', 'polar bear', 'deer', 'dog', 
+                  'scorpion', 'arctic fox', 'goat', 'hedgehog', 'chameleon', 
+                  'leopard', 'worm', 'stick insect', 'cat', 'crocodilefish', 
+                  'batfish', 'clownfish', 'frogfish', 'seadragon', 'stingaree', 
+                  'crocodile', 'starfish', 'hermit crab', 'cuttlefish', 'shrimp', 
+                  'seal', 'crab', 'octopus', 'turtle', 'scorpionfish', 'non-succulent plant']

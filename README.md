@@ -46,7 +46,8 @@ Place the file in the `./pretrained` directory:
 Download our best pre-trained model:
 
 - [model_epoch_best.pth](https://pan.baidu.com/s/1S6rWjBe-MNkV64t83nXKDQ?pwd=3zdc)
-
+- [model-best.pth.tar](https://pan.baidu.com/s/1y899cq2bmRhAZO2KL1IVVg?pwd=pw6q)
+- 
 Save it to:
 
 `./best_model_pth/model_epoch_best.pth`
